@@ -1,0 +1,1591 @@
+{$A+,B-,D+,E-,F+,I-,L+,N-,O+,R-,S+,V-}
+
+UNIT File1;
+
+INTERFACE
+
+USES
+  Common,
+  Event;
+
+PROCEDURE RewardUploader(FileName: Str12; OwnerNum, FPoints: Integer; OwnerCRC32: LongInt);
+FUNCTION SearchForDups(CONST completefn: AStr): Boolean;
+FUNCTION DizExists(CONST FN: AStr): Boolean;
+PROCEDURE GetDiz(VAR F: FileInfoRecordType; VAR V: VerbRec; VAR NumExtDesc: Byte);
+PROCEDURE Dlx(FileInfo: FileInfoRecordType; DirFileRecNum: Integer; AddDLBatch: Boolean; VAR KeyboardAbort: Boolean);
+FUNCTION DLInTime: BOOLEAN;
+FUNCTION BatchDLQueuedFiles(AddDLBatch: BOOLEAN): BOOLEAN;
+PROCEDURE Dl(CONST FN: Str12; AddDLBatch: Boolean);
+PROCEDURE GetFileDescription(VAR F: FileInfoRecordType; VAR V: VerbRec; VAR ToSysOp: Boolean);
+PROCEDURE WriteFV(F: FileInfoRecordType;DirFileRecNum: Integer; V: VerbRec);
+PROCEDURE DoFFStuff(VAR F: FileInfoRecordType; CONST FN: AStr; VAR GotPts: Integer);
+PROCEDURE ArcStuff(VAR Ok,Convt: Boolean; VAR Blks,ConvTime: LongInt;
+                   ITest: Boolean; CONST FPath: AStr; VAR FN,Descr: AStr);
+PROCEDURE DownloadFile(FileName: Str12; AddDLBatch: Boolean);
+PROCEDURE UploadFile;
+PROCEDURE FileAreaList(ShowScan: Boolean);
+PROCEDURE UnlistedDownload(FileName: AStr);
+PROCEDURE Do_Unlisted_Download;
+FUNCTION NewVPointer: LongInt;
+
+IMPLEMENTATION
+
+USES
+  Dos,
+  Archive1,
+  Email,
+  File0,
+  File2,
+  File6,
+  File8,
+  File11,
+  File12,
+  File14,
+  MultNode,
+  ShortMsg,
+  TimeFunc;
+
+PROCEDURE DebitDownloader(FilePoints: Integer);
+BEGIN
+  IF (NOT AACS(General.NoFileCredits)) AND (NOT (FNoCredits IN ThisUser.Flags))
+     AND (General.FileCreditRatio) THEN
+  BEGIN
+    AdjustBalance(FilePoints);
+    NL;
+    Print('^5Your credit has been deducted to '+FormatNumber(AccountBalance)+'.');
+    SysOpLog('^3 - Debited '+FormatNumber(FilePoints)+' '+Plural('file point',FilePoints)+' from '+Caps(ThisUser.Name)+'.');
+  END;
+END;
+
+PROCEDURE RewardUploader(FileName: Str12; OwnerNum, FPoints: Integer; OwnerCRC32: LongInt);
+VAR
+  User: UserRecordType;
+  FPCredit: LongInt;
+BEGIN
+  IF (General.RewardSystem) THEN
+    IF (OwnerNum >= 1) AND (OwnerNum <= (MaxUsers - 1)) AND (OwnerNum <> UserNum) THEN
+    BEGIN
+      LoadURec(User,OwnerNum);
+      FPCredit := Trunc(FPoints * (General.RewardRatio / 100));
+      IF (OwnerCRC32 = CRC32(User.Name)) AND (FPCredit > 0) THEN
+      BEGIN
+        IF ((User.Credit + FPCredit) < 2147483647) THEN
+          Inc(User.Credit,FPCredit)
+        ELSE
+          User.Credit := 2147483647;
+        SaveURec(User,OwnerNum);
+        SysOpLog('^3 - Credited '+FormatNumber(FPCredit)+' '+Plural('file point',FPCredit)+' to '+Caps(User.Name)+'.');
+        SendShortMessage(OwnerNum,'You received '+FormatNumber(FPCredit)+
+                         ' '+Plural('file point',FPCredit)+' for the download of '
+                         +FileName);
+      END;
+    END;
+END;
+
+PROCEDURE DoUL(Pts: Integer);
+BEGIN
+  IF (NOT AACS(General.ULValReq)) AND (NOT General.ValidateAllFiles) THEN
+  BEGIN
+    Print('^5Thanks for the upload, '+Caps(ThisUser.Name)+'!');
+    IF (General.ULDLRatio) THEN
+      Print('^5You will receive file credit as soon as the SysOp validates the file!')
+    ELSE
+      Print('^5You will receive credit as soon as the SysOp validates the file!');
+  END
+  ELSE
+  BEGIN
+    IF ((NOT General.ULDLRatio) AND (NOT General.FileCreditRatio) AND (Pts = 0)) THEN
+    BEGIN
+      Print('^5Thanks for the upload, '+Caps(ThisUser.Name)+'!');
+      Print('^5You will receive credit as soon as the Sysop validates the file!');
+    END
+    ELSE
+      AdjustBalance(-Pts);
+  END;
+END;
+
+FUNCTION OKDL(CONST F: FileInfoRecordType): Boolean;
+VAR
+  MHeader: MHeaderRec;
+  b: Boolean;
+
+  PROCEDURE Nope(CONST S: AStr; VAR B1: Boolean);
+  BEGIN
+    IF (b1) THEN
+    BEGIN
+      NL;
+      Print(S);
+    END;
+    b1 := FALSE;
+  END;
+
+BEGIN
+  b := TRUE;
+  IF (FIIsRequest IN F.FIFlags) THEN
+  BEGIN
+    PrintF('REQFILE');
+    IF (NoFile) THEN
+    BEGIN
+      NL;
+      Print('^5You must request this file -- Ask '+General.SysOpName+' for it.');
+    END;
+    NL;
+    IF (PYNQ('Request this file now? ',0,FALSE)) THEN
+    BEGIN
+      InResponseTo := #1'Request "'+SQOutSp(F.FileName)+'" from area #'+IntToStr(CompFileArea(FileArea));
+      MHeader.Status := [];
+      SEMail(1,MHeader);
+    END;
+    b := FALSE;
+  END;
+
+  IF ((FIResumeLater IN F.FIFlags) AND (NOT FileSysOp)) THEN
+    Nope('You can''t do anything with RESUME-LATER files.',B);
+
+  IF ((FINotVal IN F.FIFlags) AND (NOT AACS(General.DLUNVal))) THEN
+    Nope('You can''t do anything with UNVALIDATED files.',B);
+
+  IF ((AccountBalance < F.FilePoints) AND (F.FilePoints > 0)) AND
+     (NOT AACS(General.NoFileCredits)) AND
+     (NOT (FNoCredits IN ThisUser.Flags)) AND
+     (NOT (FANoRatio IN MemFileArea.FAFlags)) AND
+     (General.FileCreditRatio) THEN
+    Nope(lRGLngStr(26,TRUE){FString.NoFileCredits},B);
+
+  IF (NSL < (((F.Blocks * 128) + F.SizeMod) DIV Rate)) THEN
+  BEGIN
+    Nope('Insufficient time for file transfer.',B);
+    Print(Ctim(NSL));
+  END
+  ELSE
+
+  IF (NOT Exist(MemFileArea.DLPath+F.FileName)) AND (NOT Exist(MemFileArea.ULPath+F.FileName)) THEN
+  BEGIN
+    Nope('File does not actually exist.',B);
+    SysOpLog('File missing: '+SQOutSp(MemFileArea.DLPath+F.FileName));
+  END;
+  OKDL := b;
+END;
+
+PROCEDURE DLX(FileInfo: FileInfoRecordType; DirFileRecNum: Integer; AddDLBatch: Boolean; VAR KeyboardAbort: Boolean);
+VAR
+  DownloadPath,
+  CopyPath: AStr;
+  Cmd: Char;
+  LastProt: Integer;
+  TransferTime,
+  CPS: LongInt;
+  PauseDL,
+  CopyOk,
+  NoSpace,
+  DownloadOk,
+  CDRom: Boolean;
+BEGIN
+  Abort := FALSE;
+  Next := FALSE;
+
+  LIL := 0;
+
+  DisplayFileInfo(FileInfo,FALSE);
+
+  PauseDL := FALSE;
+
+  IF (NOT OKDL(FileInfo)) THEN
+    PauseDL := TRUE
+  ELSE
+  BEGIN
+
+    CDRom := FALSE;
+
+    IF (Exist(MemFileArea.DLPath+FileInfo.FileName)) THEN
+    BEGIN
+      DownloadPath := MemFileArea.DLPath;
+      IF (FACDRom IN MemFileArea.FAFlags) THEN
+        CDRom := TRUE;
+    END
+    ELSE
+      DownloadPath := MemFileArea.ULPath;
+
+    IF (InCom) THEN
+    BEGIN
+
+      Send(DownloadPath+FileInfo.FileName,CDRom,TRUE,DownloadOk,KeyboardAbort,FALSE,AddDLBatch,LastProt,TransferTime);
+
+      LIL := 0;
+
+      DownloadOk := TRUE;
+
+      IF (NOT (-LastProt IN [2,3,4,5])) THEN
+        IF (NOT KeyboardAbort) THEN
+          IF (NOT DownloadOk) THEN
+          BEGIN
+            NL;
+            Star(AOnOff(-LastProt = 1,'Text view','Download')+' unsuccessful.');
+            SysOpLog(AOnOff(-LastProt = 1,'Text view','Download')+' failed: '+SQOutSp(FileInfo.FileName)+
+                     ' from '+MemFileArea.AreaName);
+            PauseDL := TRUE;
+          END
+          ELSE
+          BEGIN
+
+            Check_Status;
+
+            IF (NOT (FANoRatio IN MemFileArea.FAFlags)) THEN
+            BEGIN
+              IF (ThisUser.Downloads < 2147483647) THEN
+                Inc(ThisUser.Downloads);
+              IF (ThisUser.DLToday < 2147483647) THEN
+                Inc(ThisUser.DLToday);
+              IF ((ThisUser.DK + (FileInfo.Blocks DIV 8)) < 2147483647) THEN
+                Inc(ThisUser.DK,(FileInfo.Blocks DIV 8))
+              ELSE
+                ThisUser.DK := 2147483647;
+              IF ((ThisUser.DLKToday + (FileInfo.Blocks DIV 8)) < 2147483647) THEN
+                Inc(ThisUser.DLKToday,(FileInfo.Blocks DIV 8))
+              ELSE
+                ThisUser.DLKToday := 2147483647;
+            END;
+
+            IF (DToday < 2147483647) THEN
+              Inc(DToday);
+
+            IF ((DKToday + (FileInfo.Blocks DIV 8)) < 2147483647) THEN
+              Inc(DKToday,(FileInfo.Blocks DIV 8))
+            ELSE
+              DKToday := 2147483647;
+
+            IF (TransferTime > 0) THEN
+              CPS := (((FileInfo.Blocks * 128) + FileInfo.SizeMod) DIV TransferTime)
+            ELSE
+              CPS := 0;
+
+            NL;
+            Star('1 file successfully '+AOnOff(-LastProt = 1,'viewed','sent')+
+                 ' in '+FormattedTime(TransferTime)+' ('+FormatNumber(CPS)+' cps).');
+
+            NL;
+            Star('^3Download totals: '+ConvertBytes((FileInfo.Blocks * 128) + FileInfo.SizeMod,FALSE)+
+                 AOnOff(FANoRatio IN MemFileArea.FAFlags,'^5 [No-Ratio]','')+'.');
+
+            SysOpLog(AOnOff(-LastProt = 1,'Viewed','Downloaded')+' "'+SQOutSp(FileInfo.FileName)+
+                     '" from '+MemFileArea.AreaName);
+
+            SysOpLog('^3 - Download totals: '+ConvertBytes((FileInfo.Blocks * 128) + FileInfo.SizeMod,FALSE)+
+                     ', '+FormattedTime(TransferTime)+', '+FormatNumber(CPS)+' cps'+
+                     AOnOff(FANoRatio IN MemFileArea.FAFlags,' [No-Ratio]','')+'.');
+
+            NL;
+            Print('^5Enjoy the file, '+Caps(ThisUser.Name)+'!');
+
+            IF (NOT (FANoRatio IN MemFileArea.FAFlags)) AND (FileInfo.FilePoints > 0) THEN
+              DebitDownloader(FileInfo.FilePoints);
+
+            SaveURec(ThisUser,UserNum);
+
+            RewardUploader(SQOutSp(FileInfo.FileName),FileInfo.OwnerNum,FileInfo.FilePoints,CRC32(FileInfo.OwnerName));
+
+            IF (DirFileRecNum <> -1) THEN
+            BEGIN
+              Inc(FileInfo.Downloaded);
+              Seek(DirFile,DirFileRecNum);
+              Write(DirFile,FileInfo);
+              LastError := IOResult;
+            END;
+
+          END;
+    END
+    ELSE
+    BEGIN
+      CopyPath := '';
+      NL;
+      InputPath('Enter the destination path',CopyPath);
+      IF (CopyPath = '') THEN
+      BEGIN
+        NL;
+        Print('Copy aborted!');
+        PauseDL := TRUE;
+      END
+      ELSE
+      BEGIN
+        NL;
+        Prompt('^1Copying ... ');
+        CopyFile(CopyOk,NoSpace,TRUE,DownloadPath+SQOutSp(FileInfo.FileName),CopyPath+SQOutSp(FileInfo.FileName));
+        IF (NoSpace) THEN
+        BEGIN
+          Print('no space on destination drive!');
+          SysOpLog('Copy no-space: "'+DownloadPath+SQOutSp(FileInfo.FileName)+
+                   '" to "'+CopyPath+SQOutSp(FileInfo.FileName)+'"!');
+          PauseDL := TRUE;
+        END
+        ELSE IF (NOT CopyOk) THEN
+        BEGIN
+          Print('failed!');
+          SysOpLog('Copy failed: "'+DownloadPath+SQOutSp(FileInfo.FileName)+'" to "'+CopyPath+SQOutSp(FileInfo.FileName)+'"!');
+          PauseDL := TRUE;
+        END
+        ELSE
+          SysOpLog('Copied file: "'+DownloadPath+SQOutSp(FileInfo.FileName)+'" to "'+CopyPath+SQOutSp(FileInfo.FileName)+'".');
+      END;
+    END;
+  END;
+
+  IF (PauseDL) THEN
+  BEGIN
+    NL;
+    Prompt('Press [^5Enter^1] to Continue or [^5Q^1]uit: ');
+    Onek(Cmd,'Q'^M,TRUE,TRUE);
+    KeyboardAbort := (Cmd = 'Q');
+    PauseDL := FALSE;
+  END;
+END;
+
+PROCEDURE dl(CONST FN: Str12; AddDLBatch: Boolean);
+VAR
+  SaveFileArea,
+  FArea: Integer;
+  GotAny,
+  junk: Boolean;
+
+  FUNCTION ScanBase(FN1: Str12; VAR GotAny1: Boolean): Boolean;
+  VAR
+    FileInfo: FileInfoRecordType;
+    DirFileRecNum: Integer;
+  BEGIN
+    ScanBase := FALSE;
+    RecNo(FileInfo,FN1,DirFileRecNum);
+    IF (BadDownloadPath) THEN
+      Exit;
+    WHILE (DirFileRecNum <> -1) AND (NOT Abort) AND (NOT HangUp) DO
+    BEGIN
+      Seek(DirFile,DirFileRecNum);
+      Read(DirFile,FileInfo);
+      BackErase(13);
+      NL;
+      IF (NOT (FINotVal IN FileInfo.FIFlags)) OR (AACS(General.DLUnVal)) THEN
+        IF AACS(MemFileArea.DLACS) THEN
+        BEGIN
+          DLX(FileInfo,DirFileRecNum,AddDLBatch,Abort);
+          ScanBase := TRUE;
+          IF (NOT (IsWildCard(FN1))) THEN
+            Abort := TRUE;
+        END
+        ELSE
+          Print('Your access level does not permit downloading this file.');
+      GotAny1 := TRUE;
+      WKey;
+      NRecNo(FileInfo,DirFileRecNum);
+    END;
+    Close(DirFile);
+    Close(VerbF);
+    LastError := IOResult;
+  END;
+
+BEGIN
+  GotAny := FALSE;
+  Abort := FALSE;
+  Next := FALSE;
+  Prompt('Searching ...');
+  IF (NOT ScanBase(FN,GotAny)) THEN
+  BEGIN
+    SaveFileArea := FileArea;
+    FArea := 1;
+    WHILE (FArea <= NumFileAreas) AND (NOT Abort) AND (NOT HangUp) DO
+    BEGIN
+      IF (FArea <> SaveFileArea) THEN
+      BEGIN
+        LoadFileArea(FArea);
+        IF (MemFileArea.Password = '') THEN  (* Doesn't scan areas with a Password ??? *)
+          ChangeFileArea(FArea);
+        IF (FileArea = FArea) THEN
+          junk := ScanBase(FN,GotAny);
+      END;
+      WKey;
+      Inc(FArea);
+    END;
+    FileArea := SaveFileArea;
+    LoadFileArea(FileArea);
+  END;
+  IF (NOT GotAny) THEN
+  BEGIN
+    BackErase(13);
+    NL;
+    Print('File not found.');
+  END;
+END;
+
+FUNCTION DLInTime: BOOLEAN;
+VAR
+  DLAllowed: BOOLEAN;
+BEGIN
+  DLAllowed := TRUE;
+  IF (NOT InTime(Timer,General.DLLowTime,General.DLHiTime)) THEN
+    DLAllowed := FALSE;
+  IF (ComPortSpeed < General.MinimumDLBaud) THEN
+    IF (NOT InTime(Timer,General.MinBaudDLLowTime,General.MinBaudDLHiTime)) THEN
+      DLAllowed := FALSE;
+  IF (NOT DLAllowed) THEN
+  BEGIN
+    NL;
+    PrintF('DLHOURS');
+    IF (NoFile) THEN
+      Print('File downloading is not allowed at this time.');
+  END;
+  DLInTime := DLAllowed;
+END;
+
+FUNCTION BatchDLQueuedFiles(AddDLBatch: BOOLEAN): BOOLEAN;
+VAR
+  DLBatch: BOOLEAN;
+BEGIN
+  DLBatch := FALSE;
+  IF (NOT AddDLBatch) AND (NumBatchDLFiles > 0) THEN
+  BEGIN
+    NL;
+    IF (PYNQ('Batch download queued files? ',0,FALSE)) THEN
+    BEGIN
+      BatchDownload;
+      DLBatch := TRUE;
+    END;
+  END;
+  BatchDLQueuedFiles := DLBatch;
+END;
+
+PROCEDURE DownloadFile(FileName: Str12; AddDLBatch: Boolean);
+BEGIN
+  IF (DLInTime) THEN
+    IF (NOT BatchDLQueuedFiles(AddDLBatch)) THEN
+    BEGIN
+      NL;
+      IF (FileName = '') THEN
+      BEGIN
+        PrintF('DLOAD');
+        IF (NOT AddDLBatch) THEN
+          { Print(FString.downloadline) }
+          lRGLngStr(23,FALSE)
+        ELSE
+          { Print(FString.AddDLBatch); }
+          lRGLngStr(31,FALSE);
+        NL;
+        Prt('File name: ');
+        MPL(12);
+        Input(FileName,12);
+        IF (FileName = '') THEN
+        BEGIN
+          NL;
+          Print('Aborted.');
+        END;
+      END;
+      IF (FileName <> '') THEN
+      BEGIN
+        IF (Pos('.',FileName) = 0) THEN
+          FileName := FileName+'.*';
+        DL(FileName,AddDLBatch);
+      END
+    END;
+END;
+
+PROCEDURE GetFileDescription(VAR F: FileInfoRecordType; VAR V: VerbRec; VAR ToSysOp: Boolean);
+VAR
+  TempS: AStr;
+  Counter: Byte;
+BEGIN
+  NL;
+  IF ((ToSysOp) AND (General.ToSysOpDir >= 1) AND (General.ToSysOpDir <= NumFileAreas)) THEN
+    Print('Begin description with (/) to make upload ''Private''.')
+  ELSE
+    ToSysOp := FALSE;
+  LoadFileArea(FileArea);
+  TempS := 'Enter your text. (Enter) alone to end. ';
+  IF ((FAUseGIFSpecs IN MemFileArea.FAFlags) AND ISGifExt(F.FileName)) THEN
+  BEGIN
+    TempS := TempS + '(35 chars/line 1, 50 chars/line 2-'+IntToStr(MaxExtDesc + 1)+')';
+    Counter := 35;
+  END
+  ELSE
+  BEGIN
+    TempS := TempS + '(50 chars/line 1-'+IntToStr(MaxExtDesc + 1)+')';
+    Counter := 50;
+  END;
+  Print(TempS);
+  REPEAT
+    Prt(': ');
+    MPL(Counter);
+    InputWC(F.Description,Counter);
+    IF ((F.Description[1] = '/') OR (RValidate IN ThisUser.Flags)) AND (ToSysOp) THEN
+    BEGIN
+      IF (General.ToSysOpDir >= 1) AND (General.ToSysOpDir <= NumFileAreas) THEN
+        FileArea := General.ToSysOpDir;
+      InitFileArea(FileArea);
+      ToSysOp := TRUE;
+    END
+    ELSE
+      ToSysOp := FALSE;
+    IF (F.Description[1] = '/') THEN
+      Delete(F.Description,1,1);
+  UNTIL ((F.Description <> '') OR (FileSysOp) OR (HangUp));
+  FillChar(V,SizeOf(V),0);
+  Counter := 0;
+  REPEAT
+    Inc(Counter);
+    Prt(': ');
+    MPL(50);
+    InputL(V[Counter],50);
+    IF (V[Counter] = '') THEN
+      Counter := MaxExtDesc;
+  UNTIL (Counter = MaxExtDesc) OR (HangUp);
+END;
+
+FUNCTION DizExists(CONST FN: AStr): Boolean;
+VAR
+  Ok: Boolean;
+BEGIN
+  DizExists := FALSE;
+  IF (ArcType(FN) > 0) THEN
+  BEGIN
+    Star('Checking for description...'#29);
+    ArcDecomp(Ok,ArcType(FN),FN,'FILE_ID.DIZ DESC.SDI');
+    IF (Ok) AND (Exist(TempDir+'ARC\FILE_ID.DIZ') OR (Exist(TempDir+'ARC\DESC.SDI'))) THEN
+      DizExists := TRUE;
+    NL;
+  END;
+END;
+
+PROCEDURE GetDiz(VAR F: FileInfoRecordType; VAR V: VerbRec; VAR NumExtDesc: Byte);
+VAR
+  DizFile: Text;
+  TempStr: Str50;
+  Counter: Byte;
+BEGIN
+  IF (Exist(TempDir+'ARC\FILE_ID.DIZ')) THEN
+    Assign(DizFile,TempDir+'ARC\FILE_ID.DIZ')
+  ELSE
+    Assign(DizFile,TempDir+'ARC\DESC.SDI');
+  Reset(DizFile);
+  IF (IOResult <> 0) THEN
+    Exit;
+  Star('Importing description.');
+  FillChar(V,SizeOf(V),0);
+  Counter := 1;
+  WHILE NOT EOF(DizFile) AND (Counter <= (MaxExtDesc + 1)) DO
+  BEGIN
+    ReadLn(DizFile,TempStr);
+    IF (TempStr = '') THEN
+      TempStr := ' ';
+    IF (Counter = 1) THEN
+      F.Description := TempStr
+    ELSE
+      V[Counter - 1] := TempStr;
+    Inc(Counter);
+  END;
+  NumExtDesc := MaxExtDesc;
+  WHILE (NumExtDesc >= 1) AND ((V[NumExtDesc] = ' ') OR (V[NumExtDesc] = '')) DO
+  BEGIN
+    V[NumExtDesc] := '';
+    Dec(NumExtDesc);
+  END;
+  Close(DizFile);
+  Erase(DizFile);
+  LastError := IOResult;
+END;
+
+PROCEDURE WriteFV(F: FileInfoRecordType; DirFileRecNum: Integer; V: VerbRec);
+VAR
+  LineNum: Byte;
+  VFO: Boolean;
+BEGIN
+  F.VTextSize := 0;
+  IF (V[1] <> '') AND (F.VPointer <> -1) THEN
+  BEGIN
+    VFO := (FileRec(VerbF).Mode <> FMClosed);
+    IF (NOT VFO) THEN
+      Reset(VerbF,1);
+    IF (IOResult = 0) THEN
+    BEGIN
+      Seek(VerbF,FileSize(VerbF));
+      FOR LineNum := 1 TO MaxExtDesc DO
+        IF (V[LineNum] <> '') THEN
+        BEGIN
+          Inc(F.VTextSize,(Length(V[LineNum]) + 1));
+          BlockWrite(VerbF,V[LineNum],(Length(V[LineNum]) + 1));
+        END;
+      IF (NOT VFO) THEN
+        Close(VerbF);
+    END;
+  END;
+  Seek(DirFile,DirFileRecNum);
+  Write(DirFile,F);
+  LastError := IOResult;
+END;
+
+PROCEDURE DoFFStuff(VAR F: FileInfoRecordType; CONST FN: AStr; VAR GotPts: Integer);
+BEGIN
+  WITH F DO
+  BEGIN
+    FileName := Align(FN);
+    Downloaded := 0;
+    OwnerNum := UserNum;
+    OwnerName := AllCaps(ThisUser.Name);
+    Date := Date2PD(DateStr);
+    DateN := DayNum(PD2Date(Date));
+    IF (NOT General.FileCreditRatio) THEN
+    BEGIN
+      FilePoints := 0;
+      GotPts := 0;
+    END
+    ELSE
+    BEGIN
+      IF (General.FileCreditCompBaseSize > 0) THEN
+        FilePoints := ((F.Blocks DIV 8) DIV General.FileCreditCompBaseSize)
+      ELSE
+        FilePoints := 0;
+      GotPts := (FilePoints * General.FileCreditComp);
+      IF (GotPts < 1) THEN
+        GotPts := 1;
+    END;
+    FIFlags := [];
+    IF (NOT General.ValidateAllFiles) AND (NOT CoSysOp) THEN
+      Include(FIFlags,FINotVal);
+  END;
+END;
+
+(*
+OldAType : current archive format, 0 IF none
+NewAType : desired archive format, 0 IF none
+OldNam : current FileName
+NewNam : desired archive format FileName
+*)
+
+PROCEDURE ArcStuff(VAR Ok,
+                   Convt: Boolean;    { IF Ok - IF converted }
+  		   VAR Blks,	      { # Blocks }
+		   ConvTime: LongInt; { convert time  }
+                   ITest: Boolean;    { whether to test integrity  }
+                   CONST FPath: AStr; { filepath  }
+                   VAR FN: AStr;      { FileName  }
+ 		   VAR Descr: AStr);  { Description  }
+VAR
+  OldNam,
+  NewNam,
+  s: AStr;
+  OldAType,
+  NewAType: Byte;
+  x,
+  y,
+  c: WORD;
+BEGIN
+  Ok := TRUE;
+
+  ConvTime := 0;
+
+  Blks := (GetFileSize(FPath+Fn) DIV 128);
+
+  IF (NOT General.TestUploads) THEN
+    Exit;
+
+  NewAType := MemFileArea.ArcType;
+
+  OldAType := 1;
+
+  OldNam := SQOutSp(FPath+FN);
+
+  WHILE (General.FileArcInfo[OldAType].Ext <> '') AND
+        (General.FileArcInfo[OldAType].Ext <> Copy(FN,Length(FN) - 2,3)) AND
+        (OldAType <= MaxArcs) DO
+    Inc(OldAType);
+
+  IF (OldAType = (MaxArcs + 1)) OR (General.FileArcInfo[OldAType].Ext = '') THEN
+    OldAType := 0;
+
+  IF (NOT General.FileArcInfo[OldAType].Active) THEN
+    OldAType := 0;
+
+  IF (NOT General.FileArcInfo[NewAType].Active) THEN
+    NewAType := 0;
+
+  IF (NewAType = 0) THEN
+    NewAType := OldAType;
+
+  IF ((OldAType <> 0) AND (NewAType <> 0)) THEN
+  BEGIN
+    NewNam := FN;
+    IF (Pos('.',NewNam) <> 0) THEN
+      NewNam := Copy(NewNam,1,(Pos('.',NewNam) - 1));
+    NewNam := SQOutSp(FPath+NewNam+'.'+General.FileArcInfo[NewAType].Ext);
+    IF ((ITest) AND (General.FileArcInfo[OldAType].TestLine <> '')) THEN
+    BEGIN
+      Star('Testing file integrity ... '#29);
+      ArcIntegrityTest(Ok,OldAType,OldNam);
+      IF (NOT Ok) THEN
+      BEGIN
+        SysOpLog('^5 '+OldNam+' on #'+IntToStr(FileArea)+': errors in integrity test');
+        Print('^3failed.');
+      END
+      ELSE
+        Print('^3passed.');
+    END;
+    IF (Ok) AND ((OldAType <> NewAType) OR General.Recompress) AND (NewAType <> 0) THEN
+    BEGIN
+      Convt := InCom; 	{* don't convert IF local AND non-file-SysOp *}
+      s := General.FileArcInfo[NewAType].Ext;
+      IF (FileSysOp) THEN
+      BEGIN
+        IF (OldAType = NewAType) THEN
+          Convt := PYNQ('Recompress this file? ',0,TRUE)
+        ELSE
+          Convt := PYNQ('Convert archive to .'+s+' format? ',0,TRUE);
+      END;
+      IF (Convt) THEN
+      BEGIN
+        NL;
+        ConvTime := GetPackDateTime;
+        ConvA(Ok,OldAType,NewAType,OldNam,NewNam);
+        ConvTime := (GetPackDateTime - ConvTime);
+        IF (Ok) THEN
+        BEGIN
+          IF (OldAType <> NewAType) THEN
+            Kill(FPath+FN);
+
+          Blks := (GetFileSize(NewNam) DIV 128);
+
+          IF (Blks = 0) THEN
+            Ok := FALSE;
+
+          FN := Align(StripName(NewNam));
+          Star('No errors in conversion, file passed.');
+        END
+        ELSE
+        BEGIN
+          IF (OldAType <> NewAType) THEN
+            Kill(NewNam);
+          SysOpLog('^5 '+OldNam+' on #'+IntToStr(FileArea)+': Conversion unsuccessful');
+          Star('errors in conversion!  Original format retained.');
+          NewAType := OldAType;
+        END;
+        Ok := TRUE;
+      END
+      ELSE
+        NewAType := OldAType;
+    END;
+    IF (Ok) AND (General.FileArcInfo[NewAType].CmtLine <> '') THEN
+    BEGIN
+      s := SQOutSp(FPath+FN);
+      ArcComment(Ok,NewAType,MemFileArea.CmtType,s);
+      Ok := TRUE;
+    END;
+  END;
+  FN := SQOutSp(FN);
+  IF ((IsGifExt(FN)) AND (FAUseGIFSpecs IN MemFileArea.FAFlags)) THEN
+  BEGIN
+    GetGIFSpecs(FPath+FN,s,x,y,c);
+    s := '('+IntToStr(x)+'x'+IntToStr(y)+','+IntToStr(c)+'c) ';
+    Descr := s + Descr;
+    if (Length(Descr) > 50) then
+      Descr := Copy(Descr,1,50);
+  END;
+END;
+
+FUNCTION searchfordups(CONST completefn: AStr): Boolean;
+VAR
+  WildFN,
+  nearfn: AStr;
+  SaveFileArea,
+  FArea,
+  FArrayRecNum: Integer;
+  AnyFound,
+  hadacc,
+  Thisboard,
+  CompleteMatch,
+  NearMatch: Boolean;
+
+  PROCEDURE searchb(FArea1: Integer; VAR FArrayRecNum: Integer; CONST FN: AStr; VAR hadacc: Boolean);
+  VAR
+    F: FileInfoRecordType;
+    DirFileRecNum: Integer;
+  BEGIN
+    hadacc := FileAreaAC(FArea1);
+    IF (NOT hadacc) OR ((fanodupecheck IN MemFileArea.FAFlags) AND NOT (FileArea = FArea1)) THEN
+      Exit;
+    FileArea := FArea1;
+    RecNo(F,FN,DirFileRecNum);
+    IF (BadDownloadPath) THEN
+      Exit;
+    WHILE (DirFileRecNum < FileSize(DirFile)) AND (DirFileRecNum <> -1) DO
+    BEGIN
+      IF (NOT AnyFound) THEN
+      BEGIN
+        NL;
+        NL;
+        AnyFound := TRUE;
+      END;
+      Seek(DirFile,DirFileRecNum);
+      Read(DirFile,F);
+      IF (CanSee(F)) THEN
+      BEGIN
+        WITH FArray[FArrayRecNum] DO
+        BEGIN
+          FArrayFileArea := FileArea;
+          FArrayDirFileRecNum := DirFileRecNum;
+        END;
+        display_file(F,FArrayRecNum,'',TRUE);
+        Inc(FArrayRecNum);
+        IF (FArrayRecNum = 100) THEN
+          FArrayRecNum := 0;
+      END;
+      IF (Align(F.FileName) = Align(completefn)) THEN
+      BEGIN
+        CompleteMatch := TRUE;
+        ThisBoard := TRUE;
+      END
+      ELSE
+      BEGIN
+        nearfn := Align(F.FileName);
+        NearMatch := TRUE;
+        ThisBoard := TRUE;
+      END;
+      NRecNo(F,DirFileRecNum);
+    END;
+    Close(DirFile);
+    Close(VerbF);
+    FileArea := SaveFileArea;
+    InitFileArea(FileArea);
+    LastError := IOResult;
+  END;
+
+BEGIN
+  SaveFileArea := FileArea;
+  InitFArray(FArray);
+  FArrayRecNum := 0;
+  AnyFound := FALSE;
+  Prompt('^5Searching for possible duplicates ... ');
+  SearchForDups := TRUE;
+  IF (Pos('.', CompleteFn) > 0) THEN
+    WildFN := Copy(CompleteFn,1,Pos('.',CompleteFn) - 1)
+  ELSE
+    WildFN := CompleteFn;
+  WildFn := SQOutSp(WildFN);
+  WHILE (WildFN[Length(WildFN)] IN ['0'..'9']) AND (Length(WildFN) > 2) DO
+    Dec(WildFN[0]);
+  WHILE (Length(WildFN) < 8) DO
+    WildFN := WildFN + '?';
+  WildFN := WildFN + '.???';
+  CompleteMatch := FALSE;
+  NearMatch := FALSE;
+  FArea := 1;
+  WHILE (FArea <= NumFileAreas) AND (NOT HangUp) DO
+  BEGIN
+    Thisboard := FALSE;
+    SearchB(FArea,FArrayRecNum,WildFN,hadacc);
+    LoadFileArea(FArea);
+    IF (CompleteMatch) THEN
+    BEGIN
+      SysOpLog('User tried to upload '+SQOutSp(completefn)+' to #'+IntToStr(SaveFileArea)+
+           '; existed in #'+IntToStr(FArea)+AOnOff(NOT HadAcc,' - no access',''));
+      NL;
+      NL;
+      IF (hadacc) THEN
+        Print('^5File "'+SQOutSp(completefn)+'" already exists in "'+MemFileArea.AreaName+'^5 #'+IntToStr(FArea)+'".')
+      ELSE
+        Print('^5File "'+SQOutSp(completefn)+ 'cannot be accepted by the system at this time.');
+      Print('^7Illegal File Name.');
+      Exit;
+    END
+    ELSE IF (NearMatch) AND (Thisboard) THEN
+    BEGIN
+      SysOpLog('User entered upload file name "'+SQOutSp(completefn)+'" in #'+
+           IntToStr(FileArea)+'; was warned that "'+SQOutSp(nearfn)+
+           '" existed in #'+IntToStr(FArea)+AOnOff(NOT HadAcc,' - no access to',''));
+    END;
+    Inc(FArea);
+  END;
+  FileArea := SaveFileArea;
+  InitFileArea(FileArea);
+  IF (NOT AnyFound) THEN
+    Print('No duplicates found.');
+  NL;
+  SearchForDups := FALSE;
+END;
+
+(*
+AExists       : if file already exists in dir
+DirFileRecNum : rec-num of file if already exists in file listing
+ResumeFile    : IF user is going to RESUME THE UPLOAD
+ULS           : whether file is to be actually UPLOADED
+OffLine       : IF uploaded a file to be OffLine automatically..
+*)
+
+PROCEDURE UL(FN: Str12; LocBatUp: Boolean; VAR AddULBatch: Boolean);
+VAR
+  fi: FILE OF Byte;
+  FileInfo: FileInfoRecordType;
+  V: VerbRec;
+  s: AStr;
+  Cmd,
+  Drive: Char;
+  OrigSizeMod,
+  Counter,
+  NumExtDesc: Byte;
+  DirFileRecNum,
+  SaveFileArea,
+  GotPts: Integer;
+  TransferTime,
+  RefundTime,
+  ConversionTime,
+  CPS,
+  lng,
+  OrigBlocks: LongInt;
+  ULS,
+  Ok,
+  KeyboardAbort,
+  Convt,
+  AExists,
+  ResumeFile,
+  WentToSysOp,
+  OffLine: Boolean;
+BEGIN
+  SaveFileArea := FileArea;
+  InitFileArea(FileArea);
+  IF (BadUploadPath) THEN
+    Exit;
+
+  Ok := TRUE;
+
+  IF (FN[1] = ' ') OR (FN[10] = ' ') THEN
+    Ok := FALSE;
+
+  FOR Counter := 1 TO Length(FN) DO
+    IF (Pos(FN[Counter],'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-!#$%^&''~()_') = 0) THEN
+    BEGIN
+      Ok := FALSE;
+      Break;
+    END;
+
+  IF (NOT Ok) THEN
+  BEGIN
+    NL;
+    Print('Illegal file name.');
+    Exit;
+  END;
+
+  ResumeFile := FALSE;
+  ULS := TRUE;
+  OffLine := FALSE;
+  Abort := FALSE;
+  Next := FALSE;
+
+  AExists := Exist(MemFileArea.ULPath+FN);
+
+  FN := Align(FN);
+  RecNo(FileInfo,FN,DirFileRecNum);
+  IF (BadUploadPath) THEN
+    Exit;
+
+  IF (DirFileRecNum <> -1) THEN
+  BEGIN
+    Seek(DirFile,DirFileRecNum);
+    Read(DirFile,FileInfo);
+    ResumeFile := (FIResumeLater IN FileInfo.FIFlags);
+    IF (ResumeFile) THEN
+    BEGIN
+      NL;
+      Print('This is a resume-later file.');
+      ResumeFile := ((FileInfo.OwnerNum = UserNum) OR (FileSysOp));
+      IF (ResumeFile) THEN
+      BEGIN
+        IF (NOT InCom) THEN
+        BEGIN
+          NL;
+          Print('Cannot be resumed locally.');
+          Exit;
+        END;
+        NL;
+        ResumeFile := PYNQ('Resume upload of "'+SQOutSp(FN)+'"? ',0,TRUE);
+        IF (NOT ResumeFile) THEN
+          Exit;
+      END
+      ELSE
+      BEGIN
+        NL;
+        Print('^7You are not the uploader of this file.');
+        Exit;
+      END;
+    END;
+  END;
+
+  IF ((NOT AExists) AND (FileSysOp) AND (NOT InCom)) THEN
+  BEGIN
+    ULS := FALSE;
+    OffLine := TRUE;
+    NL;
+    Print('This file does not exist in the files directory.');
+    NL;
+    IF NOT PYNQ('Do you want to create an offLine entry? ',0,FALSE) THEN
+      Exit;
+  END;
+
+  IF (NOT ResumeFile) THEN
+  BEGIN
+    IF (((AExists) OR (DirFileRecNum <> -1)) AND (NOT FileSysOp)) THEN
+    BEGIN
+      NL;
+      Print('File already exists.');
+      Exit;
+    END;
+    IF (FileSize(DirFile) >= MemFileArea.MaxFiles) THEN
+    BEGIN
+      NL;
+      Star('This file area is full.');
+      Exit;
+    END;
+
+    IF (NOT AExists) AND (NOT OffLine) AND
+       (DiskKBfree(MemFileArea.ULPath) <= General.MinSpaceForUpload) THEN
+    BEGIN
+      NL;
+      Star('Insufficient disk space.');
+      Drive := Chr(ExtractDriveNumber(MemFileArea.ULPath) + 64);
+      IF (Drive = '@') THEN
+        SysOpLog('^8--->^3 Upload failure: Main BBS drive full.')
+      ELSE
+        SysOpLog('^8--->^3 Upload failure: '+Drive+' Drive full.');
+      Exit;
+    END;
+
+    IF (AExists) THEN
+    BEGIN
+      ULS := FALSE;
+      NL;
+      Print('^1File exists in upload Path: '+MemFileArea.ULPath+SQOutSp(FN));
+      NL;
+      IF (DirFileRecNum <> -1) THEN
+        Print('^5Note: File exists in listing.');
+      IF (LocBatUp) THEN
+      BEGIN
+        Prompt('^7[Q]uit or Upload this? (Y/N) ['+ShowYesNo(DirFileRecNum = -1)+']: ');
+        OneK(Cmd,'QYN'^M,FALSE,FALSE);
+        IF (DirFileRecNum <> -1) THEN
+          Ok := (Cmd = 'Y')
+        ELSE
+          Ok := (Cmd IN ['Y',^M]);
+        Abort := (Cmd = 'Q');
+        IF (Abort) THEN
+          Print('^3Quit')
+        ELSE IF (NOT Ok) THEN
+          Print('^3No')
+        ELSE
+          Print('^3Yes');
+      END
+      ELSE
+        Ok := PYNQ('Upload this? (Y/N) ['+ShowYesNo(DirFileRecNum = -1)+']: ',0,(DirFileRecNum = -1));
+      DirFileRecNum := 0;
+    END;
+    IF ((General.SearchDup) AND (Ok) AND (NOT Abort) AND (InCom)) THEN
+      IF (NOT FileSysOp) OR (PYNQ('Search for duplicates? ',0,FALSE)) THEN
+        IF (SearchForDups(FN)) THEN
+          Exit;
+    IF (ULS) THEN
+      Ok := PYNQ('Upload "'+SQOutSp(FN)+'" to '+MemFileArea.AreaName+'? ',0,TRUE);
+    IF ((Ok) AND (ULS) AND (NOT ResumeFile)) THEN
+    BEGIN
+
+      Assign(fi,MemFileArea.ULPath+FN);
+      ReWrite(fi);
+      IF (IOResult <> 0) THEN
+        Ok := FALSE
+      ELSE
+      BEGIN
+        Close(fi);
+        Erase(fi);
+        IF (IOResult <> 0) THEN
+          Ok := FALSE;
+      END;
+
+      IF (NOT Ok) THEN
+      BEGIN
+        Print('Unable to upload that file name.');
+        Exit;
+      END;
+    END;
+  END;
+  IF (NOT Ok) THEN
+    Exit;
+  WentToSysOp := TRUE;
+  IF (NOT ResumeFile) THEN
+  BEGIN
+    FileInfo.FileName := Align(FN);
+    GetFileDescription(FileInfo,V,WentToSysOp);
+  END;
+  Ok := TRUE;
+
+  IF (ULS) THEN
+  BEGIN
+
+    TimeLock := TRUE;
+
+    Receive(FN,MemFileArea.ULPath,ResumeFile,Ok,KeyboardAbort,AddULBatch,TransferTime);
+
+    IF (AddULBatch) THEN
+    BEGIN
+      Inc(NumBatchULFiles);
+      New(BatchULArray[NumBatchULFiles]);
+      WITH BatchULArray[NumBatchULFiles]^ DO
+      BEGIN
+        BULFileName := SQOutSp(FN);
+        BULSection := FileArea;
+        BULDescription := FileInfo.Description;
+        IF (V[1] = '') THEN
+          BULVPointer := 0
+        ELSE
+        BEGIN
+          Inc(BatchULVPointer);
+          New(BatchULV[BatchULVPointer]);
+          BatchULV[BatchULVPointer]^ := V;
+          BULVPointer := BatchULVPointer;
+        END;
+      END;
+      Star(FormatNumber(NumBatchULFiles)+' '+Plural('file',NumBatchULFiles)+' now in upload batch queue.');
+      Star('Hit [Enter] to stop adding to queue.');
+      NL;
+      FileArea := SaveFileArea;
+      Exit;
+    END;
+
+    IF (KeyboardAbort) THEN
+    BEGIN
+      FileArea := SaveFileArea;
+      Exit;
+    END;
+
+    RefundTime := (TransferTime * (General.ULRefund DIV 100));
+    Inc(FreeTime,RefundTime);
+    TimeLock := FALSE;
+    Star('Gave time refund of '+FormattedTime(RefundTime));
+    IF (NOT KeyboardAbort) THEN
+      Star('Transfer complete.');
+    NL;
+  END;
+  NL;
+  Convt := FALSE;
+  IF (NOT OffLine) THEN
+  BEGIN
+
+    Assign(fi,MemFileArea.ULPath+FN);
+    Reset(fi);
+    IF (IOResult <> 0) THEN
+      Ok := FALSE
+    ELSE
+    BEGIN
+      FileInfo.Blocks := FileSize(fi) DIV 128;
+      FileInfo.SizeMod := FileSize(fi) MOD 128;
+      IF (FileSize(fi) = 0) THEN
+        Ok := FALSE;
+      Close(fi);
+
+      OrigBlocks := FileInfo.Blocks;
+      OrigSizeMod := FileInfo.SizeMod;
+    END;
+
+  END;
+  IF ((Ok) AND (NOT OffLine)) THEN
+  BEGIN
+    ArcStuff(Ok,Convt,FileInfo.Blocks,ConversionTime,ULS,MemFileArea.ULPath,FN,FileInfo.Description);
+    DoFFStuff(FileInfo,FN,GotPts);
+
+    IF (General.FileDiz) AND (DizExists(MemFileArea.ULPath+FN)) THEN
+      GetDiz(FileInfo,V,NumExtDesc);
+    IF (Ok) THEN
+    BEGIN
+
+      IF (V[1] <> '') THEN
+        FileInfo.VPointer := NewVPointer
+      ELSE
+        FileInfo.VPointer := -1;
+
+      IF (NOT ResumeFile) OR (DirFileRecNum = -1) THEN
+        WriteFV(FileInfo,FileSize(DirFile),V)
+      ELSE
+        WriteFV(FileInfo,DirFileRecNum,V);
+
+      IF (ULS) THEN
+      BEGIN
+        IF AACS(General.ULValReq) OR (General.ValidateAllFiles) THEN
+        BEGIN
+          Inc(ThisUser.Uploads);
+          Inc(ThisUser.UK,(FileInfo.Blocks DIV 8));
+        END;
+        Inc(UToday);
+        Inc(UKToday,(FileInfo.Blocks DIV 8));
+      END;
+      s := '^3Upload "'+SQOutSp(FN)+'" on '+MemFileArea.AreaName;
+      IF (ULS) THEN
+      BEGIN
+
+        IF (TransferTime > 0) THEN
+          CPS := (((FileInfo.Blocks * 128) + FileInfo.SizeMod) DIV TransferTime)
+        ELSE
+          CPS := 0;
+
+        s := s + '^3 ('+ConvertBytes((FileInfo.Blocks * 128) + FileInfo.SizeMod,FALSE)+', '+FormattedTime(TransferTime)+
+                 ', '+IntToStr(CPS)+' cps)';
+      END;
+      SysOpLog(s);
+      IF ((InCom) AND (ULS)) THEN
+      BEGIN
+        IF (Convt) THEN
+        BEGIN
+          lng := ((OrigBlocks * 128) + OrigSizeMod);
+          Star('Org file size: ^5'+ConvertBytes(lng,FALSE));
+        END;
+        lng := ((FileInfo.Blocks * 128) + FileInfo.SizeMod);
+        IF (Convt) THEN
+          Star('New file size: ^5'+ConvertBytes(lng,FALSE))
+        ELSE
+          Star('File size    : ^5'+ConvertBytes(lng,FALSE));
+        Star('Upload time  : ^5'+FormattedTime(TransferTime));
+        IF (Convt) THEN
+          Star('Convert time : ^5'+FormattedTime(ConversionTime));
+        Star('Transfer rate: ^5'+IntToStr(CPS)+' cps');
+        Star('Time refund  : ^5'+FormattedTime(RefundTime));
+        IF (GotPts <> 0) THEN
+          Star('Credit      : ^5'+FormatNumber(GotPts)+' pts');
+        NL;
+        IF (ChopTime > 0) THEN
+        BEGIN
+          Inc(ChopTime,RefundTime);
+          Dec(FreeTime,RefundTime);
+          Star('Sorry, no upload time refund may be given at this time.');
+          Star('You will get your refund after the event.');
+          NL;
+        END;
+        DoUL(GotPts);
+      END
+      ELSE
+        Star('Entry added.');
+    END;
+  END;
+  IF (NOT Ok) AND (NOT OffLine) THEN
+  BEGIN
+    IF (Exist(MemFileArea.ULPath+FN)) THEN
+    BEGIN
+      Star('Upload not received.');
+      s := 'file deleted';
+      IF ((FileInfo.Blocks DIV 8) > General.MinResume) THEN
+      BEGIN
+        NL;
+        IF PYNQ('Save file for a later resume? ',0,TRUE) THEN
+        BEGIN
+          DoFFStuff(FileInfo,FN,GotPts);
+          Include(FileInfo.FIFlags,FIResumeLater);
+
+          IF (V[1] <> '') THEN
+            FileInfo.VPointer := NewVPointer
+          ELSE
+            FileInfo.VPointer := -1;
+          IF (NOT AExists) OR (DirFileRecNum = -1) THEN
+            WriteFV(FileInfo,FileSize(DirFile),V)
+          ELSE
+            WriteFV(FileInfo,DirFileRecNum,V);
+
+          s := 'file saved for later resume';
+        END;
+      END;
+      IF (NOT (FIResumeLater IN FileInfo.FIFlags)) AND (Exist(MemFileArea.ULPath+FN)) THEN
+        Kill(MemFileArea.ULPath+FN);
+      SysOpLog('^3Error uploading '+SQOutSp(FN)+' - '+s);
+    END;
+    Star('Removing time refund of '+FormattedTime(RefundTime));
+    Dec(FreeTime,RefundTime);
+  END;
+  IF (OffLine) THEN
+  BEGIN
+    IF (V[1] <> '') THEN
+      FileInfo.VPointer := NewVPointer
+    ELSE
+      FileInfo.VPointer := -1;
+    FileInfo.Blocks := 0;
+    FileInfo.SizeMod := 0;
+    DoFFStuff(FileInfo,FN,GotPts);
+    Include(FileInfo.FIFlags,FIIsRequest);
+    WriteFV(FileInfo,FileSize(DirFile),V);
+  END;
+  Close(DirFile);
+  FileArea := SaveFileArea;
+  InitFileArea(FileArea);
+  Close(DirFile);
+  SaveURec(ThisUser,UserNum);
+END;
+
+PROCEDURE UploadFile;
+VAR
+  DirInfo: SearchRec;
+  FileName: Str12;
+  AddULBatch: Boolean;
+BEGIN
+  InitFileArea(FileArea);
+  IF (BadUploadPath) THEN
+    Exit;
+  IF (NOT AACS(MemFileArea.ULACS)) THEN
+  BEGIN
+    NL;
+    Star('Your access level does not permit uploading to this file area.');
+    Exit;
+  END;
+  PrintF('UPLOAD');
+  IF (NumBatchULFiles > 0) THEN
+  BEGIN
+    NL;
+    IF PYNQ('Upload queued files? ',0,FALSE) THEN
+    BEGIN
+      BatchUpload(FALSE,0);
+      Exit;
+    END;
+  END;
+  REPEAT
+    AddULBatch := FALSE;
+    { Print(FString.UploadLine); }
+    lRGLngStr(24,FALSE);
+    NL;
+    Prt('File name: ');
+    MPL(12);
+    Input(FileName,12);
+    FileName := SQOutSp(FileName);
+    IF (FileName = '') THEN
+    BEGIN
+      NL;
+      Print('Aborted.');
+    END
+    ELSE
+    BEGIN
+      IF (NOT FileSysOp) THEN
+        UL(FileName,FALSE,AddULBatch)
+      ELSE
+      BEGIN
+        IF (NOT IsWildCard(FileName)) THEN
+          UL(FileName,FALSE,AddULBatch)
+        ELSE
+        BEGIN
+          FindFirst(MemFileArea.ULPath+FileName,AnyFile - Directory - VolumeID - Hidden - SysFile,DirInfo);
+          IF (DOSError <> 0) THEN
+          BEGIN
+            NL;
+            Print('No files found.');
+          END
+          ELSE
+            REPEAT
+              UL(DirInfo.Name,TRUE,AddULBatch);
+              FindNext(DirInfo);
+            UNTIL (DOSError <> 0) OR (Abort) OR (HangUp);
+        END;
+      END;
+    END;
+  UNTIL (NOT AddUlBatch) OR (HangUp);
+END;
+
+PROCEDURE FileAreaList(ShowScan: Boolean);
+VAR
+  ScanChar,
+  TempStr: AStr;
+  NumOnline: Byte;
+  FArea,
+  NumFAreas,
+  SaveFileArea: Integer;
+BEGIN
+  SaveFileArea := FileArea;
+  Abort := FALSE;
+  Next := FALSE;
+  AllowContinue := TRUE;
+  NumOnline := 0;
+  NumFAreas := 0;
+  TempStr := '';
+  IF (ShowScan) THEN
+   ScanChar := lRGLngStr(55,TRUE); {FString.ScanCharCheck}
+  (*
+  CLS;
+  PrintACR('-旼컴컴쩡컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컫컴컴컫컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴커');
+  PrintACR('-�. Num -�/ Name                           -�. Num -�/ Name                          -�');
+  PrintACR('-읕컴컴좔컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴컨컴컴컨컴컴컴컴컴컴컴컴컴컴컴컴컴컴컴켸');
+  *)
+  lRGLngStr(59,FALSE);
+  Reset(FileAreaFile);
+  FArea := 1;
+  WHILE (FArea <= NumFileAreas) AND (NOT Abort) AND (NOT HangUp) DO
+  BEGIN
+    IF (ShowScan) THEN
+      InitFileArea(FArea)
+    ELSE
+      LoadFileArea(FArea);
+    IF AACS(MemFileArea.ACS) OR (FAUnHidden IN MemFileArea.FAFlags) THEN
+    BEGIN
+      TempStr := TempStr + PadLeftStr(PadRightStr('1'+IntToStr(CompFileArea(FArea)),5)+
+                           ' '+AOnOff(ShowScan AND NewScanFileArea,'0'+ScanChar[1],' ')+
+                           '2 '+MemFileArea.AreaName,39);
+      Inc(NumOnline);
+      IF (NumOnline = 2) THEN
+      BEGIN
+        PrintACR(TempStr);
+        NumOnline := 0;
+        TempStr := '';
+      END;
+      Inc(NumFAreas);
+    END;
+    WKey;
+    Inc(FArea);
+  END;
+  Close(FileAreaFile);
+  AllowContinue := FALSE;
+  LastError := IOResult;
+  IF (NumOnline = 1) AND (NOT Abort) AND (NOT HangUp) THEN
+    PrintaCR(TempStr);
+  IF (NumFAreas = 0) AND (NOT Abort) AND (NOT HangUp) THEN
+    Print('^7No file areas.');
+  NL;
+  FileArea := SaveFileArea;
+  LoadFileArea(FileArea);
+END;
+
+PROCEDURE UnlistedDownload(FileName: AStr);
+VAR
+  DirInfo: SearchRec;
+  Path: PathStr;
+  Name: NameStr;
+  Ext: ExtStr;
+  Cmd: Char;
+  LastProt,
+  SaveFileArea: Integer;
+  TransferTime: LongInt;
+  PauseDL,
+  CopyOk,
+  Nospace,
+  DownloadOk,
+  KeyboardAbort: Boolean;
+BEGIN
+  IF (FileName <> '') THEN
+  BEGIN
+    FSplit(FileName,Path,Name,Ext);
+    IF (NOT Exist(FileName)) THEN
+    BEGIN
+      NL;
+      Print('File not found.');
+    END
+    ELSE
+    BEGIN
+      SaveFileArea := FileArea;
+      FileArea := -1;
+      Abort := FALSE;
+      Next := FALSE;
+      PauseDL := FALSE;
+      FindFirst(SQOutSp(FileName),AnyFile - Directory - VolumeID - Hidden - SysFile,DirInfo);
+      WHILE (DOSError = 0) AND (NOT Abort) AND (NOT HangUp) DO
+      BEGIN
+        FileName := Path+DirInfo.Name;
+        NL;
+        Print('^1File: ^5'+StripName(FileName)+'^1');
+        IF (InCom) THEN
+        BEGIN
+          Send(FileName,FALSE,FALSE,DownloadOk,KeyboardAbort,TRUE,FALSE,LastProt,TransferTime);
+          IF (KeyboardAbort) THEN
+            Abort := TRUE
+          ELSE IF (NOT (-LastProt IN [2,3,4,5])) THEN
+            IF (NOT DownloadOk) THEN
+            BEGIN
+              NL;
+              Star(AOnOff(-LastProt = 1,'Text view','Download')+' unsuccessful.');
+              SysOpLog(AOnOff(-LastProt = 1,'Text view','Download')+' failed: '+SQOutSp(FileName)+' - (Unlisted)');
+              PauseDL := TRUE;
+            END
+            ELSE IF (DownloadOk) THEN
+            BEGIN
+              Check_Status;
+              NL;
+              Star(SQoutSp(StripName(FileName))+' successfully '+AOnOff(-LastProt = 1,'viewed','sent')+
+                   ' in '+FormattedTime(TransferTime));
+              SysOpLog(AOnOff(-LastProt = 1,'Text view','Download')+' successfull: '+SQOutSp(FileName)+' - (Unlisted)');
+              NL;
+              Star('Total: '+ConvertBytes(DirInfo.Size,FALSE));
+            END;
+        END
+        ELSE
+        BEGIN
+          Path := '';
+          NL;
+          InputPath('Enter the destination path',Path);
+          IF (Path = '') THEN
+          BEGIN
+            NL;
+            Print('Copy aborted!');
+            PauseDL := TRUE;
+          END
+          ELSE
+          BEGIN
+            NL;
+            Prompt('^1Copying ... ');
+            CopyFile(CopyOk,NoSpace,TRUE,SQOutSp(FileName),Path+SQOutSp(StripName(FileName)));
+            IF (NoSpace) THEN
+            BEGIN
+              Print('no space on destination drive!');
+              SysOpLog('Copy no-space: "'+SQOutSp(FileName)+
+                       '" to "'+Path+SQOutSp(StripName(FileName))+'" - (Unlisted)!');
+              PauseDL := TRUE;
+            END
+            ELSE IF (NOT CopyOk) THEN
+            BEGIN
+              Print('failed!');
+              SysOpLog('Copy failed: "'+SQOutSp(FileName)+'" to "'+Path+SQOutSp(StripName(FileName))+'" - (Unlisted)!');
+              PauseDL := TRUE;
+            END
+            ELSE
+              SysOpLog('Copied file: "'+SQOutSp(FileName)+'" to "'+Path+SQOutSp(StripName(FileName))+'" - (Unlisted).');
+          END;
+        END;
+        IF (PauseDL) THEN
+        BEGIN
+          NL;
+          Prompt('Press [^5Enter^1] to Continue or [^5Q^1]uit: ');
+          Onek(Cmd,'Q'^M,TRUE,TRUE);
+          Abort := (Cmd = 'Q');
+          PauseDL := FALSE;
+        END;
+        FindNext(DirInfo);
+      END;
+      FileArea := SaveFileArea;
+      LoadFileArea(FileArea);
+    END;
+  END;
+END;
+
+PROCEDURE Do_Unlisted_Download;
+VAR
+  PathFileName: Str52;
+BEGIN
+  NL;
+  Print('Enter file name to download (d:path\filename.ext)');
+  Prt(': ');
+  MPL(52);
+  Input(PathFileName,52);
+  IF (PathFileName = '') THEN
+  BEGIN
+    NL;
+    Print('Aborted.');
+  END
+  ELSE IF (NOT IsUL(PathFileName)) THEN
+  BEGIN
+    NL;
+    Print('You must specify the complete path to the file.');
+  END
+  ELSE
+    UnlistedDownload(PathFileName)
+END;
+
+FUNCTION NewVPointer: LongInt;
+VAR
+  VFO: Boolean;
+BEGIN
+  VFO := (FileRec(VerbF).Mode <> FMClosed);
+  IF (NOT VFO) THEN
+    Reset(VerbF,1);
+  NewVPointer := (FileSize(VerbF) + 1);
+  IF (NOT VFO) THEN
+    Close(VerbF);
+  LastError := IOResult;
+END;
+
+END.
